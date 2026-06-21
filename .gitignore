@@ -1,0 +1,11 @@
+# datasets & models are large — do NOT commit them
+datasets/helmet_rider/train/
+datasets/helmet_rider/valid/
+datasets/helmet_rider/test/
+models/
+data.runtime.yaml
+*.db
+evidence/
+__pycache__/
+*.pyc
+.venv/

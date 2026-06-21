@@ -1,0 +1,11 @@
+# ARIA-Enforce — training + demo dependencies
+ultralytics>=8.4.18
+opencv-python>=4.10
+numpy>=1.26
+pandas>=2.0
+gradio>=4.44
+# OCR (optional — app falls back to "UNKNOWN" plate if not installed):
+paddleocr>=2.7
+paddlepaddle>=2.6
+# NOTE on RTX 50-series (Blackwell) GPUs: install a CUDA 12.8+ PyTorch FIRST:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
