@@ -1,34 +1,34 @@
 """
 ARIA-Enforce — Demo app (Gradio).
 
-One-command, no-Docker reviewer surface for the Round-2 submission:
-  Tab 1  Violation Detection  — upload a traffic photo → annotated evidence,
-                                detected violations, severity, plate, e-challans.
-  Tab 2  Analytics & Reports  — counts by type, trend, daily revenue, search.
-  Tab 3  Event & Congestion   — historical hotspots + pre-emptive risk alerts.
+Clean, tabular, one-command reviewer surface:
+  Tab 1  Detect Violations   — upload a photo -> annotated evidence + a table
+                               of violations and auto-generated e-challans.
+  Tab 2  Analytics & Reports — totals, by-type table, daily summary, search.
+  Tab 3  Congestion Forecast — historical hotspots + pre-emptive risk alerts.
 
 Run:
-    pip install -r aria/enforce/requirements-enforce.txt
-    python -m aria.enforce.app          # from project root
+    python -m aria_enforce.app            # local
+    python -m aria_enforce.app --share    # public link (for the Demo Link field)
 """
 from __future__ import annotations
 import os
-import datetime as _dt
+import sys
 
 import cv2
-import numpy as np
-import pandas as pd
 import gradio as gr
 
 from aria_enforce.image_pipeline import EnforcePipeline
-from aria_enforce.challan import challan_text
 from aria_enforce import event_alert as ea
 
 DB_PATH = os.environ.get("ENFORCE_DB", "enforce_evidence.db")
 EVENT_CSV = os.environ.get("ENFORCE_EVENTS", "data/astram_events.csv")
 
-_pipeline: EnforcePipeline | None = None
+_pipeline = None
 _events_df = None
+
+VIOLATION_HEADERS = ["#", "Violation", "Severity", "Confidence",
+                     "Vehicle", "Plate", "Fine (Rs)", "Challan ID"]
 
 
 def pipeline() -> EnforcePipeline:
@@ -45,39 +45,63 @@ def events_df():
     return _events_df
 
 
-# ── Tab 1: detection ────────────────────────────────────────────────────────
-def run_detection(image, signal_state, stop_line_y):
+def _status_line() -> str:
+    s = pipeline().status
+    nice = {"ok": "ready", "missing": "not loaded",
+            "model_pending": "not trained yet", "error": "error"}
+    return (f"**System status** — vehicle detector: {nice.get(s['vehicle_model'])} · "
+            f"helmet model: {nice.get(s['helmet_model'])} · "
+            f"plate OCR: {nice.get(s['ocr'])} · "
+            f"image enhancement: {nice.get(s['weather'])}")
+
+
+# ── Tab 1: detection ─────────────────────────────────────────────────────────
+def run_detection(image, use_rules, signal_state, stop_line_y):
     if image is None:
-        return None, [], "Upload an image to begin."
+        return None, "Upload a traffic photo and click **Analyze image**.", []
     bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    zones = {"stop_line_y": int(stop_line_y)} if stop_line_y else None
-    sig = None if signal_state == "Unknown" else signal_state.upper()
+    zones = None
+    sig = None
+    if use_rules:
+        sig = None if signal_state == "Unknown" else signal_state.upper()
+        if stop_line_y and stop_line_y > 0:
+            zones = {"stop_line_y": int(stop_line_y)}
     res = pipeline().process(bgr, signal_state=sig, zones=zones)
-
     rgb = cv2.cvtColor(res.annotated, cv2.COLOR_BGR2RGB)
-    rows = [[c.challan_id, c.violation_label, f"{c.confidence:.0%}",
-             c.severity_bucket, f"Rs {c.fine_inr}", c.anonymized_plate]
-            for c in res.challans]
-    if res.challans:
-        slips = "\n\n".join(challan_text(c) for c in res.challans)
+
+    rows = []
+    total = 0
+    for i, c in enumerate(res.challans, 1):
+        total += c.fine_inr
+        rows.append([i, c.violation_label, c.severity_bucket,
+                     f"{c.confidence:.0%}", c.vehicle_class, c.anonymized_plate,
+                     c.fine_inr, c.challan_id])
+
+    if rows:
+        summary = (f"### {len(rows)} violation(s) detected — total fine Rs {total:,}\n"
+                   f"Each row below is an auto-generated e-challan. "
+                   f"Annotated evidence is on the right.")
     else:
-        st = res.status
-        slips = ("No violations detected.\n\nModel status: "
-                 f"vehicle={st['vehicle_model']}, helmet={st['helmet_model']}, "
-                 f"ocr={st['ocr']}, weather={st['weather']}")
-    return rgb, rows, slips
+        summary = ("### No violations detected\n"
+                   "Either the scene is compliant, or no rider/vehicle was found. "
+                   "Try a clearer photo of traffic.\n\n" + _status_line())
+    return rgb, summary, rows
 
 
-# ── Tab 2: analytics ────────────────────────────────────────────────────────
+# ── Tab 2: analytics ─────────────────────────────────────────────────────────
 def load_analytics():
     s = pipeline().store
-    by_type = [[r["violation_label"], r["n"], f"Rs {r['total_fine'] or 0}"]
-               for r in s.counts_by_type()]
     today = s.daily_summary()
-    summary = (f"Today ({today['date']}): {today['challans']} challans · "
-               f"Rs {today['revenue']} fines · avg severity {today['avg_sev']:.2f}/5")
+    summary = (f"### Today — {today['challans']} challans · "
+               f"Rs {today['revenue']:,} in fines · "
+               f"avg severity {today['avg_sev']:.1f}/5")
+    by_type = [[r["violation_label"], r["n"], f"Rs {r['total_fine'] or 0:,}"]
+               for r in s.counts_by_type()]
     trend = [[r["day"], r["n"]] for r in s.trend()]
-    return by_type, summary, trend
+    if not by_type:
+        summary = ("### No challans issued yet\n"
+                   "Analyze some images in Tab 1 first — they'll appear here.")
+    return summary, by_type, trend
 
 
 def search_challans(plate, bucket):
@@ -85,79 +109,104 @@ def search_challans(plate, bucket):
     rows = s.search(plate=plate or None,
                     bucket=(None if bucket == "Any" else bucket))
     return [[r["challan_id"], r["violation_label"], r["severity_bucket"],
-             f"Rs {r['fine_inr']}", r["anonymized_plate"], r["issued_at"][:16]]
+             f"Rs {r['fine_inr']:,}", r["anonymized_plate"], r["issued_at"][:16]]
             for r in rows]
 
 
-# ── Tab 3: event/congestion ─────────────────────────────────────────────────
+# ── Tab 3: congestion ────────────────────────────────────────────────────────
 def load_events_view(by, hour):
     df = events_df()
     if df is None:
-        return [], [], "Event data not found at " + EVENT_CSV
+        return ("Event data not found. Place the CSV at "
+                f"`{EVENT_CSV}` to enable this tab.", [], [])
+    counts = df["event_type"].value_counts().to_dict()
+    note = (f"### {len(df):,} historical traffic events analysed\n"
+            f"Planned vs unplanned: {counts}. "
+            f"Hotspots and risk alerts for hour {int(hour):02d}:00 below.")
     hs = [[h.name, h.events, h.top_cause, f"{h.closure_rate:.0%}"]
           for h in ea.hotspots(df, by, 10)]
-    alerts = [[a["location"], a["risk"], a["band"]]
+    alerts = [[a["location"], f"{a['risk']}/100", a["band"]]
               for a in ea.current_alerts(df, int(hour), by)]
-    note = (f"{len(df)} historical events · "
-            f"{df['event_type'].value_counts().to_dict()}")
-    return hs, alerts, note
+    return note, hs, alerts
 
 
-# ── UI ──────────────────────────────────────────────────────────────────────
+# ── UI ───────────────────────────────────────────────────────────────────────
 def build():
-    with gr.Blocks(title="ARIA-Enforce") as demo:
-        gr.Markdown("# 🚦 ARIA-Enforce — AI Traffic Violation Detection\n"
-                    "Upload a traffic photo → detect violations → auto e-challan "
-                    "→ analytics. Part of the ITMS adaptive-traffic platform.")
-        with gr.Tab("1 · Violation Detection"):
+    with gr.Blocks(title="ARIA-Enforce", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            "# ARIA-Enforce — AI Traffic Violation Detection\n"
+            "Upload a traffic photo and the system detects road users, identifies "
+            "violations (helmet, stop-line, red-light, illegal parking, …), reads "
+            "the number plate, and issues an **e-challan** — with annotated "
+            "evidence. Part of the ITMS adaptive-traffic platform.")
+
+        with gr.Tab("1 · Detect Violations"):
+            gr.Markdown("**How to use:** upload a photo → click **Analyze image** "
+                        "→ review the violations table and annotated evidence.")
             with gr.Row():
-                with gr.Column():
-                    inp = gr.Image(label="Traffic image", type="numpy")
-                    sig = gr.Dropdown(["Unknown", "Red", "Green", "Amber"],
-                                      value="Unknown", label="Signal state")
-                    sly = gr.Slider(0, 2000, value=0, step=10,
-                                    label="Stop-line y-pixel (0 = off)")
-                    btn = gr.Button("Detect violations", variant="primary")
-                with gr.Column():
-                    out_img = gr.Image(label="Annotated evidence")
-            out_tbl = gr.Dataframe(
-                headers=["Challan", "Violation", "Conf", "Severity", "Fine", "Plate"],
-                label="Issued e-challans")
-            out_txt = gr.Textbox(label="e-Challan slips", lines=14)
-            btn.click(run_detection, [inp, sig, sly], [out_img, out_tbl, out_txt])
+                with gr.Column(scale=1):
+                    inp = gr.Image(label="Traffic photo", type="numpy",
+                                   height=300)
+                    with gr.Accordion("Optional: intersection rules", open=False):
+                        use_rules = gr.Checkbox(
+                            label="Apply stop-line / red-light rules", value=False)
+                        signal_state = gr.Dropdown(
+                            ["Unknown", "Red", "Green", "Amber"],
+                            value="Unknown", label="Signal state")
+                        stop_line_y = gr.Slider(
+                            0, 2000, value=0, step=10,
+                            label="Stop-line position (y-pixel; 0 = off)")
+                    btn = gr.Button("Analyze image", variant="primary", size="lg")
+                with gr.Column(scale=1):
+                    out_img = gr.Image(label="Annotated evidence", height=300)
+            out_summary = gr.Markdown()
+            out_tbl = gr.Dataframe(headers=VIOLATION_HEADERS, wrap=True,
+                                   label="Violations & e-challans",
+                                   interactive=False)
+            btn.click(run_detection, [inp, use_rules, signal_state, stop_line_y],
+                      [out_img, out_summary, out_tbl])
 
         with gr.Tab("2 · Analytics & Reports"):
-            a_btn = gr.Button("Refresh analytics")
-            a_sum = gr.Textbox(label="Daily summary")
-            a_tbl = gr.Dataframe(headers=["Violation", "Count", "Fines"],
-                                 label="Violations by type")
-            a_trd = gr.Dataframe(headers=["Day", "Challans"], label="Daily trend")
-            a_btn.click(load_analytics, None, [a_tbl, a_sum, a_trd])
-            gr.Markdown("### Search records")
+            a_btn = gr.Button("Load / refresh analytics", variant="primary")
+            a_sum = gr.Markdown()
             with gr.Row():
-                s_plate = gr.Textbox(label="Plate contains")
+                a_tbl = gr.Dataframe(headers=["Violation", "Count", "Total fines"],
+                                     label="Violations by type", interactive=False)
+                a_trd = gr.Dataframe(headers=["Date", "Challans"],
+                                     label="Daily trend", interactive=False)
+            gr.Markdown("#### Search records")
+            with gr.Row():
+                s_plate = gr.Textbox(label="Plate contains", scale=2)
                 s_bucket = gr.Dropdown(["Any", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
-                                       value="Any", label="Severity")
-                s_btn = gr.Button("Search")
+                                       value="Any", label="Severity", scale=1)
+                s_btn = gr.Button("Search", scale=1)
             s_tbl = gr.Dataframe(
-                headers=["Challan", "Violation", "Severity", "Fine", "Plate", "When"])
+                headers=["Challan ID", "Violation", "Severity", "Fine",
+                         "Plate", "Issued"], interactive=False)
+            a_btn.click(load_analytics, None, [a_sum, a_tbl, a_trd])
             s_btn.click(search_challans, [s_plate, s_bucket], s_tbl)
 
-        with gr.Tab("3 · Event & Congestion Alerts"):
-            gr.Markdown("Predictive layer over historical traffic-event data.")
+        with gr.Tab("3 · Congestion Forecast"):
+            gr.Markdown("Predictive layer over historical traffic-event data — "
+                        "find congestion hotspots and get pre-emptive risk alerts.")
             with gr.Row():
                 e_by = gr.Dropdown(["junction", "zone", "corridor"],
-                                   value="junction", label="Group by")
-                e_hr = gr.Slider(0, 23, value=18, step=1, label="Hour of day")
-                e_btn = gr.Button("Analyze")
-            e_note = gr.Textbox(label="Dataset")
-            e_hs = gr.Dataframe(headers=["Location", "Events", "Top cause", "Closure%"],
-                                label="Congestion hotspots")
-            e_al = gr.Dataframe(headers=["Location", "Risk", "Band"],
-                                label="Pre-emptive alerts for this hour")
-            e_btn.click(load_events_view, [e_by, e_hr], [e_hs, e_al, e_note])
+                                   value="junction", label="Group by", scale=1)
+                e_hr = gr.Slider(0, 23, value=18, step=1,
+                                 label="Hour of day", scale=2)
+                e_btn = gr.Button("Analyze", variant="primary", scale=1)
+            e_note = gr.Markdown()
+            with gr.Row():
+                e_hs = gr.Dataframe(
+                    headers=["Location", "Events", "Top cause", "Road-closure rate"],
+                    label="Congestion hotspots", interactive=False)
+                e_al = gr.Dataframe(
+                    headers=["Location", "Risk", "Band"],
+                    label="Pre-emptive alerts for this hour", interactive=False)
+            e_btn.click(load_events_view, [e_by, e_hr], [e_note, e_hs, e_al])
     return demo
 
 
 if __name__ == "__main__":
-    build().launch()
+    share = ("--share" in sys.argv) or os.environ.get("SHARE") == "1"
+    build().launch(share=share)

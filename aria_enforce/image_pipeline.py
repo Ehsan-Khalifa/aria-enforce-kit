@@ -2,18 +2,10 @@
 ARIA-Enforce — Single-image enforcement pipeline (the demo's engine).
 
 Flow per uploaded image:
-    image
-      → WeatherProcessor   (assess + enhance: low-light/rain/fog)   [reused]
-      → VehicleDetector    (YOLO26m, 11 Indian classes)             [reused]
-      → RiderAttributeModel(helmet / no-helmet / plate)             [Phase 1]
-      → image_violations   (helmet, triple, stop-line, parking, …)
-      → PlateReader        (OCR + anonymization)                    [reused]
-      → severity + challan + EvidenceStore (SQLite)
-      → annotate           (court-ready evidence image)
+    image -> weather enhance -> vehicle detect -> helmet (adaptive) ->
+    violations -> plate OCR -> severity -> e-challan -> store -> annotate.
 
-Every heavy dependency is imported lazily and degrades gracefully: if a model
-or library is missing, that stage is skipped and reported in `status` rather
-than crashing — so the app runs today and lights up fully once training lands.
+Every heavy dependency is imported lazily and degrades gracefully.
 """
 from __future__ import annotations
 import logging
@@ -24,8 +16,9 @@ from typing import Optional
 
 import numpy as np
 
-from .config import (VEHICLE_MODEL_WEIGHTS, HELMET_MODEL_WEIGHTS, get_spec)
-from .rider_model import RiderAttributeModel
+from .config import (VEHICLE_MODEL_WEIGHTS, HELMET_MODEL_WEIGHTS, get_spec,
+                     semantic)
+from .rider_model import RiderAttributeModel, RiderBox, RiderInference
 from .image_violations import (detect_rider_violations, detect_zone_violations,
                                ImageViolation)
 from .severity import score_violation
@@ -39,8 +32,8 @@ logger = logging.getLogger("aria.enforce.pipeline")
 @dataclass
 class EnforceResult:
     annotated:   np.ndarray
-    challans:    list = field(default_factory=list)   # list[Challan]
-    violations:  list = field(default_factory=list)   # enriched dicts
+    challans:    list = field(default_factory=list)
+    violations:  list = field(default_factory=list)
     vehicles:    list = field(default_factory=list)
     weather:     str = "n/a"
     status:      dict = field(default_factory=dict)
@@ -110,6 +103,64 @@ class EnforcePipeline:
         return [{"bbox": d.bbox, "vehicle_class": d.vehicle_class,
                  "confidence": d.confidence} for d in dets]
 
+    def _helmet_riders(self, frame, two_wheelers) -> RiderInference:
+        """Adaptive helmet stage. If the helmet model genuinely LOCALIZES
+        (a scene detector returns multiple non-full-frame boxes), use those
+        directly. If it behaves like a whole-image CLASSIFIER, fall back to
+        per-rider crops. Works before and after the detection-dataset retrain."""
+        if not self.helmet.ready:
+            return RiderInference(status=self.helmet._status, boxes=[])
+        full = self.helmet.infer(frame)
+        if full.status == "ok" and full.boxes:
+            h, w = frame.shape[:2]
+            area = float(max(1, h * w))
+            proper = []
+            for b in full.boxes:
+                if semantic(b.kind) not in ("helmet", "no_helmet"):
+                    continue
+                bw = max(0, b.bbox[2] - b.bbox[0])
+                bh = max(0, b.bbox[3] - b.bbox[1])
+                if (bw * bh) < 0.55 * area and b.confidence >= 0.45:
+                    proper.append(b)
+            if proper:
+                return RiderInference(status="ok", boxes=proper)
+        return self._classify_riders(frame, two_wheelers)
+
+    def _classify_riders(self, frame, two_wheelers) -> RiderInference:
+        """Two-stage helmet check: classify each two-wheeler rider crop and keep
+        the single winning verdict (helmet vs no_helmet) per rider."""
+        if not self.helmet.ready:
+            return RiderInference(status=self.helmet._status, boxes=[])
+        if not two_wheelers:
+            return RiderInference(status="ok", boxes=[])
+        h, w = frame.shape[:2]
+        boxes: list[RiderBox] = []
+        for tw in two_wheelers:
+            x1, y1, x2, y2 = [int(c) for c in tw["bbox"]]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 - x1 < 20 or y2 - y1 < 20:
+                continue
+            ey1 = max(0, y1 - int(0.6 * (y2 - y1)))   # extend up to include the head
+            crop = frame[ey1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            res = self.helmet.infer(crop)
+            if res.status != "ok" or not res.boxes:
+                continue
+            cand = [b for b in res.boxes
+                    if semantic(b.kind) in ("helmet", "no_helmet")]
+            if not cand:
+                continue
+            best = max(cand, key=lambda b: b.confidence)
+            if best.confidence < 0.50:        # drop low-confidence/uncertain verdicts
+                continue
+            fb = [best.bbox[0] + x1, best.bbox[1] + ey1,
+                  best.bbox[2] + x1, best.bbox[3] + ey1]
+            boxes.append(RiderBox(bbox=fb, kind=best.kind,
+                                  confidence=best.confidence))
+        return RiderInference(status="ok", boxes=boxes)
+
     def _ocr_plate(self, frame, bbox) -> str:
         if not self._ocr:
             return "UNKNOWN"
@@ -137,13 +188,16 @@ class EnforcePipeline:
         else:
             proc, weather = img_bgr, "n/a"
 
-        # 2. vehicles + 3. rider attributes
+        # 2. vehicles
         vehicles = self._detect_vehicles(proc)
-        rider = self.helmet.infer(proc)
+        two_wheelers = [v for v in vehicles if v.get("vehicle_class") == "two_wheeler"]
+
+        # 3. rider attributes (adaptive: detector boxes, else per-rider crops)
+        rider = self._helmet_riders(proc, two_wheelers)
 
         # 4. violations
         vlist: list[ImageViolation] = []
-        vlist += detect_rider_violations(rider, vehicles)
+        vlist += detect_rider_violations(rider, two_wheelers)
         vlist += detect_zone_violations(vehicles, zones, signal_state)
 
         scene_n = max(1, len(vehicles))

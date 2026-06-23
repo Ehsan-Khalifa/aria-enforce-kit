@@ -2,7 +2,16 @@
 datasets/helmet_rider/train/
 datasets/helmet_rider/valid/
 datasets/helmet_rider/test/
-models/
+datasets/helmet_det/
+# Training run artifacts (curves, batch previews, last.pt) — regenerable, not needed to run
+models/runs/
+# Ignore models/ by default, but ship the deployed helmet weight so the app runs on clone
+models/*
+!models/helmet/
+models/helmet/*
+!models/helmet/weights/
+models/helmet/weights/*
+!models/helmet/weights/best.pt
 data.runtime.yaml
 *.db
 evidence/
