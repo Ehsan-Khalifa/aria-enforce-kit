@@ -1,109 +1,101 @@
 # ARIA-Enforce — AI Traffic Violation Detection (Training + Demo Kit)
 
-Self-contained kit to **train** the helmet/plate model and **run** the
-image-based traffic-violation demo. Theme: *Automated Photo Identification &
+Self-contained kit to **run** the image-based traffic-violation demo and
+**retrain** the helmet detector. Theme: *Automated Photo Identification &
 Classification for Traffic Violations Using Computer Vision.*
 
-Detects: helmet non-compliance, seatbelt, triple-riding, stop-line, red-light,
-illegal parking, wrong-side, pedestrian-crossing — then issues an **e-challan**
-with severity scoring and stores annotated evidence. Includes an analytics
-dashboard and a predictive **event/congestion** panel.
+Upload a traffic photo → it detects riders, flags violations (helmet, stop-line,
+red-light, illegal parking, …), reads the number plate, scores severity, and
+issues an **e-challan** with annotated evidence. Includes an analytics dashboard
+and a predictive **congestion-forecast** panel.
+
+A trained helmet model (`models/helmet/weights/best.pt`, ~5 MB) ships with the
+repo, so the demo works right after install.
 
 ---
 
-## 0. Prerequisites
-- Python 3.10 or 3.11
-- An NVIDIA GPU strongly recommended for training (CPU works but is slow)
-- ~3 GB free disk for the dataset
+## Quick start
 
-## 1. Get the code
+### Windows (easiest — double-click)
+1. Double-click **`setup.bat`** once (creates a venv + installs everything).
+2. Double-click **`run_demo.bat`** — a browser tab opens with the demo.
+
+### Any OS (terminal)
 ```bash
-git clone <your-repo-url> aria-enforce-kit
-cd aria-enforce-kit
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-```
-
-## 2. Install dependencies
-
-**If you have an RTX 50-series (5060/5070/5080/5090 — "Blackwell"), install
-PyTorch FIRST (older torch will fail with sm_120 / "no kernel image" errors):**
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-```
-Then, for everyone:
-```bash
+# Windows: .venv\Scripts\activate   |   macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+python -m aria_enforce.app            # add --share for a public link
 ```
-Verify the GPU is visible:
-```bash
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-```
-Expected: `True  NVIDIA GeForce RTX 5060 ...`
+Open the printed URL (e.g. http://127.0.0.1:7860).
 
-## 3. Download the dataset
-Download **Helmet and No Helmet Rider Detection v5** from Roboflow
-(https://universe.roboflow.com/gw-khadatkar-and-sv-wasule/helmet-and-no-helmet-rider-detection)
-→ **Download Dataset → Format: YOLOv8 → zip**, then unzip into
-`datasets/helmet_rider/` so it looks like:
-```
-datasets/helmet_rider/train/images/  + labels/
-datasets/helmet_rider/valid/images/  + labels/
-datasets/helmet_rider/test/images/   + labels/
-```
-(More detail in `datasets/helmet_rider/PLACEHOLDER.md`.)
+> **RTX 50-series (Blackwell) GPUs:** install a CUDA 12.8 PyTorch first —
+> `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128`
 
-## 4. Train  ← the long step, do this on the GPU machine
-```bash
-python train_helmet.py --device 0
-```
-Defaults: **yolo26n, 40 epochs** (fast; ~20–40 min on an RTX 5060-class GPU).
-Options:
-```bash
-python train_helmet.py --device 0 --model m --epochs 60   # higher accuracy, slower
-python train_helmet.py --device cpu                        # no GPU (slow)
-```
-On success it writes `models/helmet/weights/best.pt` and prints test mAP.
-**Send `models/helmet/weights/best.pt` back** (it's small) so it can be plugged
-into the full system.
+The demo tabs:
+- **Detect Violations** — upload a photo → annotated evidence + a table of
+  violations and auto-generated e-challans.
+- **Analytics & Reports** — counts by type, daily revenue, trend, search.
+- **Congestion Forecast** — hotspots + pre-emptive risk alerts (needs
+  `data/astram_events.csv`).
 
-## 5. Run the demo
-```bash
-python -m aria_enforce.app
-```
-Open the printed URL (e.g. http://127.0.0.1:7860):
-- **Tab 1 — Violation Detection:** upload a traffic photo → annotated evidence,
-  violations, severity, plate, e-challans.
-- **Tab 2 — Analytics & Reports:** counts, trends, daily revenue, search.
-- **Tab 3 — Event & Congestion Alerts:** needs `data/astram_events.csv` (optional).
+---
 
-> The app **degrades gracefully**: before training, helmet checks show
-> "model pending" but the UI still runs. After step 4, it activates
-> automatically. The large vehicle-detection model isn't shipped in this kit
-> (too big for GitHub); helmet/seatbelt violations work without it.
+## Retrain the helmet model (optional)
 
-## Troubleshooting
-- **`CUDA available: False`** → install the cu128 PyTorch (step 2) and update your NVIDIA driver.
-- **`Missing datasets/helmet_rider/...`** → finish step 3; folders must be `train/valid/test` directly under `datasets/helmet_rider/`.
-- **OCR not working** → `pip install paddleocr paddlepaddle`; optional, plate shows `UNKNOWN` without it.
-- **Out of memory while training** → add `--batch 8` (or `--imgsz 480`).
+The helmet detector must be trained on a **detection-style** dataset (per-rider
+bounding boxes), NOT a whole-image classifier dataset — otherwise it flags every
+person. Use the included verifier to be sure.
+
+1. Download a helmet **detection** dataset (YOLOv8 export) with classes like
+   `With Helmet` / `Without Helmet` (real traffic scenes, multiple boxed riders).
+   Unzip it into `datasets/helmet_det/` so `train/ valid/ test/ data.yaml` sit
+   directly inside.
+2. **Verify it first:**
+   ```bash
+   python verify_dataset.py --data datasets/helmet_det
+   ```
+   Proceed only if it reports **DETECTION-STYLE** (boxes/image > 1.3,
+   full-frame < 25%).
+3. **Train** (dataset-agnostic — reads the dataset's own classes):
+   ```bash
+   python train_helmet.py --data datasets/helmet_det --device 0
+   ```
+   Defaults: YOLO26n, 60 epochs. On success it writes
+   `models/helmet/weights/best.pt`, which the app loads automatically.
+4. **Evaluate:**
+   ```bash
+   python evaluate.py --weights models/helmet/weights/best.pt \
+       --data datasets/helmet_det --names "With Helmet,Without Helmet"
+   ```
+
+**Current model** (YOLO26n on a per-rider detection dataset): mAP50 **0.89**,
+F1 0.85 (With Helmet 0.92 / Without Helmet 0.87 mAP50), ~5 MB, real-time.
+
+---
+
+## Notes
+- The large 11-class Indian **vehicle detector** and **PaddleOCR** are not
+  bundled here (size). Helmet violations + e-challans work without them; the full
+  local system (in the main project) adds vehicle-based stop-line/parking + OCR.
+- The app **degrades gracefully** — any missing model/library is skipped and
+  shown in the status line rather than crashing.
 
 ## Layout
 ```
-train_helmet.py            training entry point
+setup.bat / run_demo.bat / run_demo.sh   one-click setup & launch
+train_helmet.py        train on datasets/helmet_det
+verify_dataset.py      check a dataset is detection-style before training
+evaluate.py            per-class metrics + efficiency report
 requirements.txt
-datasets/helmet_rider/     <- put dataset here (gitignored)
-data/                      <- optional astram_events.csv
-models/                    <- training outputs (gitignored)
+models/helmet/weights/best.pt            trained helmet model (ships with repo)
+datasets/helmet_det/   put a detection dataset here to retrain (gitignored)
+data/                  optional astram_events.csv for the congestion tab
 aria_enforce/
-  app.py                   Gradio demo (3 tabs)
-  image_pipeline.py        orchestrator
-  config.py                violation catalog + fines + severity
-  image_violations.py      helmet/triple + geometry rules
-  rider_model.py           helmet model wrapper (stub-capable)
-  severity.py challan.py store.py annotate.py event_alert.py
-  vision/                  detector / ocr / weather (reused ARIA modules)
+  app.py               Gradio demo (3 tabs)
+  image_pipeline.py    orchestrator (adaptive helmet stage)
+  config.py            violation catalog + fines + severity
+  image_violations.py  helmet/triple + geometry rules
+  rider_model.py severity.py challan.py store.py annotate.py event_alert.py
+  vision/              detector / ocr / weather modules
 ```
